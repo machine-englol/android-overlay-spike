@@ -1,0 +1,704 @@
+workflows:
+  android-spike:
+    name: Spike APK (overlay + Python)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      java: 17
+    scripts:
+      - name: Gerar projeto Android (so se ainda nao existir no repositorio)
+        script: |
+          if [ -f settings.gradle.kts ]; then
+            echo 'Projeto ja existe no repositorio; usando os arquivos dele.'
+            exit 0
+          fi
+          cat > settings.gradle.kts <<'EOF_SPIKE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+                  maven("https://chaquo.com/maven")
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://chaquo.com/maven")
+              }
+          }
+
+          rootProject.name = "AndroidOverlaySpike"
+          include(":app")
+          EOF_SPIKE
+          cat > build.gradle.kts <<'EOF_SPIKE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+              id("com.chaquo.python") version "16.0.0" apply false
+          }
+          EOF_SPIKE
+          cat > gradle.properties <<'EOF_SPIKE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          android.useAndroidX=true
+          EOF_SPIKE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_SPIKE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("com.chaquo.python")
+          }
+
+          android {
+              namespace = "com.saturno.spike"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.saturno.spike"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1-spike"
+
+                  ndk {
+                      abiFilters += listOf("arm64-v8a")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          chaquopy {
+              defaultConfig {
+                  version = "3.11"
+                  buildPython(System.getenv("CHAQUO_PY") ?: "python3")
+              }
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_SPIKE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Overlay Spike"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="overlay_drawing" />
+                  </service>
+
+              </application>
+          </manifest>
+          EOF_SPIKE
+          mkdir -p app/src/main/java/com/saturno/spike
+          cat > app/src/main/java/com/saturno/spike/LogBus.kt <<'EOF_SPIKE'
+          package com.saturno.spike
+
+          /** Barramento de logs simples: Kotlin e Python escrevem aqui, a Activity mostra no console. */
+          object LogBus {
+              @Volatile
+              var listener: ((String) -> Unit)? = null
+
+              private val history = ArrayList<String>()
+
+              @Synchronized
+              fun log(msg: String) {
+                  history.add(msg)
+                  if (history.size > 500) history.removeAt(0)
+                  listener?.invoke(msg)
+              }
+
+              @Synchronized
+              fun dump(): List<String> = ArrayList(history)
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main/java/com/saturno/spike
+          cat > app/src/main/java/com/saturno/spike/DrawCanvasView.kt <<'EOF_SPIKE'
+          package com.saturno.spike
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.MotionEvent
+          import android.view.View
+
+          /** Canvas da overlay: guarda formas e redesenha. Sempre chamar os add* na thread principal. */
+          class DrawCanvasView(context: Context) : View(context) {
+
+              private sealed class Shape {
+                  class Line(val x1: Float, val y1: Float, val x2: Float, val y2: Float, val color: Int) : Shape()
+                  class Box(val l: Float, val t: Float, val r: Float, val b: Float, val color: Int) : Shape()
+                  class Circle(val cx: Float, val cy: Float, val r: Float, val color: Int) : Shape()
+                  class Label(val x: Float, val y: Float, val s: String, val color: Int) : Shape()
+              }
+
+              private val shapes = ArrayList<Shape>()
+
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = 4f
+                  textSize = 40f
+              }
+
+              /** true = a overlay recebe toques (modo interativo). */
+              var interactive: Boolean = false
+
+              fun clearShapes() {
+                  shapes.clear()
+                  invalidate()
+              }
+
+              fun addLine(x1: Float, y1: Float, x2: Float, y2: Float, color: Int) {
+                  shapes.add(Shape.Line(x1, y1, x2, y2, color))
+                  invalidate()
+              }
+
+              fun addBox(l: Float, t: Float, r: Float, b: Float, color: Int) {
+                  shapes.add(Shape.Box(l, t, r, b, color))
+                  invalidate()
+              }
+
+              fun addCircle(cx: Float, cy: Float, r: Float, color: Int) {
+                  shapes.add(Shape.Circle(cx, cy, r, color))
+                  invalidate()
+              }
+
+              fun addLabel(x: Float, y: Float, s: String, color: Int) {
+                  shapes.add(Shape.Label(x, y, s, color))
+                  invalidate()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  for (s in shapes) {
+                      when (s) {
+                          is Shape.Line -> {
+                              paint.style = Paint.Style.STROKE
+                              paint.color = s.color
+                              canvas.drawLine(s.x1, s.y1, s.x2, s.y2, paint)
+                          }
+                          is Shape.Box -> {
+                              paint.style = Paint.Style.STROKE
+                              paint.color = s.color
+                              canvas.drawRect(s.l, s.t, s.r, s.b, paint)
+                          }
+                          is Shape.Circle -> {
+                              paint.style = Paint.Style.STROKE
+                              paint.color = s.color
+                              canvas.drawCircle(s.cx, s.cy, s.r, paint)
+                          }
+                          is Shape.Label -> {
+                              paint.style = Paint.Style.FILL
+                              paint.color = s.color
+                              canvas.drawText(s.s, s.x, s.y, paint)
+                          }
+                      }
+                  }
+              }
+
+              override fun onTouchEvent(event: MotionEvent): Boolean {
+                  if (!interactive) return false
+                  if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE) {
+                      addCircle(event.x, event.y, 24f, Color.YELLOW)
+                  }
+                  return true
+              }
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main/java/com/saturno/spike
+          cat > app/src/main/java/com/saturno/spike/OverlayBridge.kt <<'EOF_SPIKE'
+          package com.saturno.spike
+
+          /**
+           * Ponte estática para o Python desenhar na overlay:
+           *   from com.saturno.spike import OverlayBridge
+           *   OverlayBridge.rect(100.0, 300.0, 600.0, 700.0, 0xFF0000)
+           * Cores em 0xRRGGBB (alpha é adicionado aqui).
+           */
+          object OverlayBridge {
+              /** Ponto na borda esquerda do retângulo do demo, usado no teste de pixel da captura. */
+              const val DEMO_X = 100
+              const val DEMO_Y = 500
+
+              @Volatile
+              var canvas: DrawCanvasView? = null
+
+              private fun argb(rgb: Int): Int = rgb or (0xFF shl 24)
+
+              @JvmStatic
+              fun clear() {
+                  val v = canvas ?: return
+                  v.post { v.clearShapes() }
+              }
+
+              @JvmStatic
+              fun line(x1: Float, y1: Float, x2: Float, y2: Float, color: Int) {
+                  val v = canvas ?: return
+                  v.post { v.addLine(x1, y1, x2, y2, argb(color)) }
+              }
+
+              @JvmStatic
+              fun rect(l: Float, t: Float, r: Float, b: Float, color: Int) {
+                  val v = canvas ?: return
+                  v.post { v.addBox(l, t, r, b, argb(color)) }
+              }
+
+              @JvmStatic
+              fun circle(cx: Float, cy: Float, r: Float, color: Int) {
+                  val v = canvas ?: return
+                  v.post { v.addCircle(cx, cy, r, argb(color)) }
+              }
+
+              @JvmStatic
+              fun text(x: Float, y: Float, s: String, color: Int) {
+                  val v = canvas ?: return
+                  v.post { v.addLabel(x, y, s, argb(color)) }
+              }
+
+              /** Desenho de demonstração (vermelho na borda esquerda x=DEMO_X, que cruza y=DEMO_Y). */
+              @JvmStatic
+              fun demo() {
+                  clear()
+                  rect(DEMO_X.toFloat(), 300f, 600f, 700f, 0xFF0000)
+                  circle(350f, 1000f, 120f, 0x00FF00)
+                  line(100f, 1200f, 600f, 1400f, 0x0000FF)
+                  text(100f, 250f, "overlay spike", 0xFFFFFF)
+              }
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main/java/com/saturno/spike
+          cat > app/src/main/java/com/saturno/spike/OverlayService.kt <<'EOF_SPIKE'
+          package com.saturno.spike
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.WindowManager
+
+          class OverlayService : Service() {
+
+              companion object {
+                  const val ACTION_PASSTHROUGH = "spike.PASSTHROUGH"
+                  const val ACTION_INTERACTIVE = "spike.INTERACTIVE"
+                  const val ACTION_SECURE_TOGGLE = "spike.SECURE_TOGGLE"
+                  const val ACTION_DEMO = "spike.DEMO"
+                  const val ACTION_STOP = "spike.STOP"
+                  private const val CHANNEL = "overlay"
+              }
+
+              private lateinit var wm: WindowManager
+              private lateinit var lp: WindowManager.LayoutParams
+              private var view: DrawCanvasView? = null
+              private var passthrough = true
+              private var secure = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  startAsForeground()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+
+                  lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      computeFlags(),
+                      PixelFormat.TRANSLUCENT
+                  )
+
+                  val v = DrawCanvasView(this)
+                  v.interactive = !passthrough
+                  view = v
+                  OverlayBridge.canvas = v
+                  wm.addView(v, lp)
+                  LogBus.log("[overlay] criada (passthrough)")
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_PASSTHROUGH -> {
+                          passthrough = true
+                          applyFlags()
+                          LogBus.log("[overlay] modo passthrough")
+                      }
+                      ACTION_INTERACTIVE -> {
+                          passthrough = false
+                          applyFlags()
+                          LogBus.log("[overlay] modo interativo")
+                      }
+                      ACTION_SECURE_TOGGLE -> {
+                          secure = !secure
+                          applyFlags()
+                          LogBus.log("[overlay] FLAG_SECURE=$secure")
+                      }
+                      ACTION_DEMO -> {
+                          OverlayBridge.demo()
+                          LogBus.log("[overlay] demo desenhado")
+                      }
+                      ACTION_STOP -> {
+                          stopSelf()
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  OverlayBridge.canvas = null
+                  view?.let { runCatching { wm.removeView(it) } }
+                  view = null
+                  LogBus.log("[overlay] removida")
+                  super.onDestroy()
+              }
+
+              private fun computeFlags(): Int {
+                  var f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                  if (passthrough) f = f or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  if (secure) f = f or WindowManager.LayoutParams.FLAG_SECURE
+                  return f
+              }
+
+              private fun applyFlags() {
+                  lp.flags = computeFlags()
+                  view?.let {
+                      it.interactive = !passthrough
+                      wm.updateViewLayout(it, lp)
+                  }
+              }
+
+              private fun startAsForeground() {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Overlay", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setSmallIcon(android.R.drawable.ic_menu_edit)
+                      .setContentTitle("Overlay ativa")
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main/java/com/saturno/spike
+          cat > app/src/main/java/com/saturno/spike/PythonRunner.kt <<'EOF_SPIKE'
+          package com.saturno.spike
+
+          import android.content.Context
+          import com.chaquo.python.Python
+          import com.chaquo.python.android.AndroidPlatform
+
+          /** Objeto passado ao Python para ele escrever no console: logger.log("texto"). */
+          class PyLogger {
+              fun log(msg: String) {
+                  LogBus.log(msg)
+              }
+          }
+
+          object PythonRunner {
+              /** Roda app/src/main/python/<module>.py -> main(logger) em thread de background. */
+              fun runAsync(context: Context, module: String = "hello") {
+                  val appContext = context.applicationContext
+                  val t = Thread {
+                      try {
+                          if (!Python.isStarted()) {
+                              Python.start(AndroidPlatform(appContext))
+                          }
+                          LogBus.log("[py] iniciando $module")
+                          Python.getInstance().getModule(module).callAttr("main", PyLogger())
+                          LogBus.log("[py] terminou")
+                      } catch (e: Throwable) {
+                          LogBus.log("[py] ERRO: ${e.message}")
+                      }
+                  }
+                  t.name = "py-runner"
+                  t.isDaemon = true
+                  t.start()
+              }
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main/java/com/saturno/spike
+          cat > app/src/main/java/com/saturno/spike/RootShell.kt <<'EOF_SPIKE'
+          package com.saturno.spike
+
+          import java.io.File
+
+          object RootShell {
+              /** Executa um comando via su -c e devolve (código de saída, saída combinada). */
+              fun run(cmd: String): Pair<Int, String> {
+                  val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+                  val out = p.inputStream.bufferedReader().readText()
+                  return p.waitFor() to out
+              }
+
+              /** screencap -p via root direto para um arquivo. Devolve um resumo para o log. */
+              fun screencap(dest: File): String {
+                  val p = ProcessBuilder("su", "-c", "screencap -p").start()
+                  val bytes = p.inputStream.readBytes()
+                  val err = p.errorStream.bufferedReader().readText()
+                  val code = p.waitFor()
+                  dest.writeBytes(bytes)
+                  return "exit=$code bytes=${bytes.size} err=${err.take(120)}"
+              }
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main/java/com/saturno/spike
+          cat > app/src/main/java/com/saturno/spike/MainActivity.kt <<'EOF_SPIKE'
+          package com.saturno.spike
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+
+          class MainActivity : Activity() {
+
+              private lateinit var console: TextView
+              private lateinit var scroll: ScrollView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(24, 48, 24, 24)
+                  }
+
+                  fun btn(label: String, onClick: () -> Unit) {
+                      val b = Button(this)
+                      b.text = label
+                      b.setOnClickListener { onClick() }
+                      col.addView(b)
+                  }
+
+                  btn("1. Permissão de overlay") { askOverlayPermission() }
+                  btn("2. Iniciar overlay") { startOverlay() }
+                  btn("Desenhar demo") { sendOverlay(OverlayService.ACTION_DEMO) }
+                  btn("Modo passthrough") { sendOverlay(OverlayService.ACTION_PASSTHROUGH) }
+                  btn("Modo interativo") { sendOverlay(OverlayService.ACTION_INTERACTIVE) }
+                  btn("FLAG_SECURE on/off") { sendOverlay(OverlayService.ACTION_SECURE_TOGGLE) }
+                  btn("Rodar Python (background)") { PythonRunner.runAsync(this) }
+                  btn("Captura root + teste de pixel") { captureTest() }
+                  btn("Parar overlay") { sendOverlay(OverlayService.ACTION_STOP) }
+                  btn("Copiar log") {
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("log", console.text))
+                      LogBus.log("[ui] log copiado para a area de transferencia")
+                  }
+
+                  console = TextView(this).apply {
+                      typeface = Typeface.MONOSPACE
+                      textSize = 12f
+                  }
+                  scroll = ScrollView(this)
+                  scroll.addView(console)
+                  col.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  setContentView(col)
+
+                  for (line in LogBus.dump()) console.append(line + "\n")
+                  LogBus.listener = { line ->
+                      runOnUiThread {
+                          console.append(line + "\n")
+                          scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                      }
+                  }
+              }
+
+              override fun onDestroy() {
+                  LogBus.listener = null
+                  super.onDestroy()
+              }
+
+              private fun askOverlayPermission() {
+                  if (Settings.canDrawOverlays(this)) {
+                      LogBus.log("[perm] overlay já concedida")
+                  } else {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                  }
+              }
+
+              private fun startOverlay() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      LogBus.log("[perm] conceda a permissão de overlay primeiro")
+                      return
+                  }
+                  sendOverlay("")
+              }
+
+              private fun sendOverlay(action: String) {
+                  val i = Intent(this, OverlayService::class.java)
+                  if (action.isNotEmpty()) i.action = action
+                  startForegroundService(i)
+              }
+
+              /**
+               * Tira um screencap via root e confere se a borda vermelha do demo aparece no PNG.
+               * overlay_visivel=true => a overlay entra na captura.
+               */
+              private fun captureTest() {
+                  val t = Thread {
+                      val f = File(cacheDir, "shot.png")
+                      try {
+                          LogBus.log("[cap] ${RootShell.screencap(f)}")
+                          val bmp = BitmapFactory.decodeFile(f.path)
+                          if (bmp == null) {
+                              LogBus.log("[cap] PNG inválido (root negado?)")
+                          } else {
+                              var hit = false
+                              var sample = 0
+                              val y = OverlayBridge.DEMO_Y
+                              for (dx in -3..3) {
+                                  val x = OverlayBridge.DEMO_X + dx
+                                  if (x < 0 || x >= bmp.width || y >= bmp.height) continue
+                                  val p = bmp.getPixel(x, y)
+                                  if (dx == 0) sample = p
+                                  if (Color.red(p) > 200 && Color.green(p) < 80 && Color.blue(p) < 80) hit = true
+                              }
+                              LogBus.log(
+                                  "[cap] ${bmp.width}x${bmp.height} pixel=#%08X overlay_visivel=%b".format(sample, hit)
+                              )
+                          }
+                      } catch (e: Exception) {
+                          LogBus.log("[cap] ERRO: ${e.message}")
+                      }
+                  }
+                  t.isDaemon = true
+                  t.start()
+              }
+          }
+          EOF_SPIKE
+          mkdir -p app/src/main/python
+          cat > app/src/main/python/hello.py <<'EOF_SPIKE'
+          import subprocess
+          import sys
+
+
+          def main(logger):
+              logger.log("python " + sys.version.split()[0])
+
+              # subprocess (shell normal, sem root)
+              r = subprocess.run(["sh", "-c", "id; getprop ro.product.model"],
+                                 capture_output=True, text=True)
+              logger.log("sh: " + r.stdout.strip().replace("\n", " | "))
+
+              # rede
+              try:
+                  import urllib.request
+                  with urllib.request.urlopen("https://api.github.com", timeout=5) as resp:
+                      logger.log("rede ok: HTTP %s" % resp.status)
+              except Exception as e:
+                  logger.log("rede falhou: %r" % (e,))
+
+              # Python -> overlay (precisa da overlay iniciada)
+              try:
+                  from com.saturno.spike import OverlayBridge
+                  OverlayBridge.demo()
+                  logger.log("overlay: demo desenhado via Python")
+              except Exception as e:
+                  logger.log("overlay falhou: %r" % (e,))
+
+              # Exemplo com root (descomente para testar):
+              # r = subprocess.run(["su", "-c", "input swipe 500 1500 500 500 300"],
+              #                    capture_output=True, text=True)
+              # logger.log("su: exit=%s %s" % (r.returncode, r.stderr.strip()))
+          EOF_SPIKE
+          cat > .gitignore <<'EOF_SPIKE'
+          *.iml
+          .gradle/
+          .idea/
+          local.properties
+          build/
+          build.log
+          .cxx/
+          EOF_SPIKE
+          cat > README.md <<'EOF_SPIKE'
+          # android-overlay-spike
+
+          Spike do app Android (Kotlin) com Python embutido (Chaquopy), overlay e teste de captura via root.
+          O APK e compilado pelo GitHub Actions (.github/workflows/build.yml) e publicado em Releases ("spike latest").
+          No app, use o botao "Copiar log" para copiar os resultados e colar na conversa.
+          EOF_SPIKE
+
+      - name: Instalar Python 3.11 (usado pelo Chaquopy no build)
+        script: |
+          brew install python@3.11
+          PY="$(brew --prefix python@3.11)/bin/python3.11"
+          "$PY" --version
+          echo "CHAQUO_PY=$PY" >> "$CM_ENV"
+      - name: Apontar o Android SDK
+        script: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          cat local.properties
+      - name: Compilar APK debug
+        script: |
+          curl -sL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+          /tmp/gradle-8.7/bin/gradle assembleDebug --no-daemon --stacktrace
+    artifacts:
+      - app/build/outputs/apk/debug/*.apk
